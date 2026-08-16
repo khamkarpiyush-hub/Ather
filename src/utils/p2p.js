@@ -10,6 +10,9 @@ import { identify } from '@libp2p/identify';
 import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
 import { pipe } from 'it-pipe';
 
+import { multiaddr } from '@multiformats/multiaddr';
+import { bootstrap } from '@libp2p/bootstrap';
+
 let libp2pNode;
 let activePeers = new Map();
 const LOCAL_CHUNK_STORE = new Map(); // Local silent storage bucket
@@ -53,17 +56,30 @@ export async function initP2PNode(onPeerDiscovered, onPeerLost) {
     activePeers.delete(peerId.toString());
   });
 
+
   await libp2pNode.start();
   console.log('P2P Node started with ID:', libp2pNode.peerId.toString());
 
-  // Try connecting to the local relay server if running
+  // Connect to your live Render cloud relay server
   try {
-    await libp2pNode.dial('/ip4/127.0.0.1/tcp/9090/ws');
+    await libp2pNode.dial(multiaddr('/dns/swarmvault-relay.onrender.com/tcp/443/wss'));
+    console.log('Connected to SwarmVault Cloud Relay!');
   } catch (e) {
-    console.log('Relay server not active yet, running standalone/discovery mode.');
+    console.log('Cloud relay unreachable, running standalone/discovery mode.', e);
   }
 
   return libp2pNode;
+//   await libp2pNode.start();
+//   console.log('P2P Node started with ID:', libp2pNode.peerId.toString());
+
+//   // Try connecting to the local relay server if running
+//   try {
+//     await libp2pNode.dial('/ip4/127.0.0.1/tcp/9090/ws');
+//   } catch (e) {
+//     console.log('Relay server not active yet, running standalone/discovery mode.');
+//   }
+
+//   return libp2pNode;
 }
 
 export function registerSilentStorageReceiver(node) {
