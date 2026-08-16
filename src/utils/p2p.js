@@ -11,7 +11,6 @@ import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
 import { pipe } from 'it-pipe';
 
 import { multiaddr } from '@multiformats/multiaddr';
-import { bootstrap } from '@libp2p/bootstrap';
 
 let libp2pNode;
 let activePeers = new Map();
@@ -69,6 +68,9 @@ export async function initP2PNode(onPeerDiscovered, onPeerLost) {
   }
 
   return libp2pNode;
+
+
+//   connecting live relay server to connect with other peers in the swarm
 //   await libp2pNode.start();
 //   console.log('P2P Node started with ID:', libp2pNode.peerId.toString());
 
