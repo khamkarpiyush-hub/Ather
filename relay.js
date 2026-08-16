@@ -3,7 +3,6 @@ import { webSockets } from '@libp2p/websockets';
 import { noise } from '@chainsafe/libp2p-noise';
 import { yamux } from '@chainsafe/libp2p-yamux';
 import { circuitRelayServer } from '@libp2p/circuit-relay-v2';
-import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { identify } from '@libp2p/identify';
 
 async function main() {
@@ -18,12 +17,11 @@ async function main() {
     streamMultiplexers: [yamux()],
     services: {
       relay: circuitRelayServer(),
-      pubsub: gossipsub(),
       identify: identify()
     }
   });
 
-  console.log(`🚀 SwarmVault Public Relay running successfully with PubSub!`);
+  console.log(`🚀 SwarmVault Public Relay running successfully!`);
   console.log(`Peer ID: ${server.peerId.toString()}`);
   server.getMultiaddrs().forEach((ma) => console.log(`Listening on: ${ma.toString()}`));
 }
@@ -32,8 +30,6 @@ main().catch((err) => {
   console.error('Failed to start relay server:', err);
   process.exit(1);
 });
-
-
 
 //   works 
 // import { createLibp2p } from 'libp2p';
