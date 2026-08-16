@@ -7,12 +7,12 @@ import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
 import { identify } from '@libp2p/identify';
 import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
+import { bootstrap } from '@libp2p/bootstrap';
 import { pipe } from 'it-pipe';
-import { multiaddr } from '@multiformats/multiaddr';
 
 let libp2pNode;
 let activePeers = new Map();
-const LOCAL_CHUNK_STORE = new Map(); // Local silent storage bucket
+const LOCAL_CHUNK_STORE = new Map();
 
 export async function initP2PNode(onPeerDiscovered, onPeerLost) {
   libp2pNode = await createLibp2p({
@@ -31,19 +31,24 @@ export async function initP2PNode(onPeerDiscovered, onPeerLost) {
       identify: identify()
     },
     peerDiscovery: [
+      bootstrap({
+        list: [
+          '/dns/swarmvault-relay.onrender.com/tcp/443/wss'
+        ]
+      }),
       pubsubPeerDiscovery({
         topics: ['swarmvault-discovery']
       })
     ]
   });
 
-  // Register the silent storage receiver protocol listener on startup
   registerSilentStorageReceiver(libp2pNode);
 
   libp2pNode.addEventListener('peer:discovery', (evt) => {
     const peerId = evt.detail.id;
     if (onPeerDiscovered) onPeerDiscovered(peerId);
     activePeers.set(peerId.toString(), peerId);
+    console.log('Discovered peer:', peerId.toString());
   });
 
   libp2pNode.addEventListener('peer:disconnect', (evt) => {
@@ -55,23 +60,6 @@ export async function initP2PNode(onPeerDiscovered, onPeerLost) {
   await libp2pNode.start();
   console.log('P2P Node started with ID:', libp2pNode.peerId.toString());
 
-  // Connect to your live Render cloud relay with an auto-retry loop (handles Render free-tier sleep mode)
-  const connectToRelay = async (retries = 6, delay = 5000) => {
-    for (let i = 0; i < retries; i++) {
-      try {
-        await libp2pNode.dial(multiaddr('/dns/swarmvault-relay.onrender.com/tcp/443/wss'));
-        console.log('Connected to SwarmVault Cloud Relay!');
-        break;
-      } catch (e) {
-        console.log(`Cloud relay is waking up, retrying in ${delay / 1000}s (${i + 1}/${retries})...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-  };
-
-  // Run the connection attempt in the background
-  connectToRelay();
-
   return libp2pNode;
 }
 
@@ -82,7 +70,6 @@ export function registerSilentStorageReceiver(node) {
         stream.source,
         async function (source) {
           for await (const chunk of source) {
-            // Save received shard into local silent storage
             const chunkKey = Math.random().toString();
             LOCAL_CHUNK_STORE.set(chunkKey, chunk.subarray());
           }
@@ -94,7 +81,6 @@ export function registerSilentStorageReceiver(node) {
   });
 }
 
-// --- NEW DATABASE HELPER ---
 function getDB() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open('SwarmVaultDB', 1);
@@ -112,7 +98,6 @@ export async function distributeChunks(node, chunks, peersMap) {
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
     
-    // If no real peers, store in local IndexedDB
     if (peerIds.length === 0 || peerIds[0] === 'local-network-mock') {
       const fallbackKey = `simulated-peer-chunk-${Date.now()}-${i}`;
       await new Promise((resolve) => {
@@ -131,7 +116,6 @@ export async function distributeChunks(node, chunks, peersMap) {
       await pipe([chunk], stream.sink);
       distributionManifest[i] = targetPeer.toString();
     } catch (err) {
-      // Fallback to local DB if network fails
       const fallbackKey = `local-fallback-${Date.now()}-${i}`;
       const tx = db.transaction('chunks', 'readwrite');
       tx.objectStore('chunks').put(chunk, fallbackKey);
@@ -146,7 +130,6 @@ export async function fetchChunks(node, manifest) {
   const db = await getDB();
 
   for (const [chunkIndex, peerIdStr] of Object.entries(manifest)) {
-    // Check local permanent database first
     const localChunk = await new Promise(resolve => {
        const req = db.transaction('chunks').objectStore('chunks').get(peerIdStr);
        req.onsuccess = () => resolve(req.result);
@@ -158,7 +141,6 @@ export async function fetchChunks(node, manifest) {
       continue;
     }
 
-    // Otherwise fetch from swarm
     try {
       const peerId = activePeers.get(peerIdStr);
       if (!peerId) throw new Error(`Peer not connected`);
