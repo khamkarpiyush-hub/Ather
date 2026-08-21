@@ -1,0 +1,64 @@
+import { createLibp2p } from 'libp2p';
+import { webSockets } from '@libp2p/websockets';
+import { noise } from '@chainsafe/libp2p-noise';
+import { yamux } from '@chainsafe/libp2p-yamux';
+import { circuitRelayServer } from '@libp2p/circuit-relay-v2';
+import { gossipsub } from '@chainsafe/libp2p-gossipsub';
+import { identify } from '@libp2p/identify';
+import { generateKeyPair, privateKeyFromProtobuf, privateKeyToProtobuf } from '@libp2p/crypto/keys';
+import fs from 'fs';
+
+const KEY_FILE = './relay-key.json';
+
+async function getOrCreatePrivateKey() {
+  if (fs.existsSync(KEY_FILE)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(KEY_FILE, 'utf-8'));
+      return privateKeyFromProtobuf(Uint8Array.from(raw));
+    } catch (e) {
+      console.warn('⚠️  Could not load saved key, generating new one:', e.message);
+    }
+  }
+
+  const privateKey = await generateKeyPair('Ed25519');
+  const protobuf = privateKeyToProtobuf(privateKey);
+  fs.writeFileSync(KEY_FILE, JSON.stringify(Array.from(protobuf)));
+  console.log('🔑 Generated and saved new persistent relay key.');
+  return privateKey;
+}
+
+async function main() {
+  const port = process.env.PORT || 10000;
+  const privateKey = await getOrCreatePrivateKey();
+
+  const server = await createLibp2p({
+    privateKey,
+    addresses: {
+      listen: [`/ip4/0.0.0.0/tcp/${port}/ws`]
+    },
+    transports: [webSockets()],
+    connectionEncrypters: [noise()],
+    streamMultiplexers: [yamux()],
+    services: {
+      relay: circuitRelayServer(),
+      pubsub: gossipsub(),
+      identify: identify()
+    }
+  });
+
+  const peerId = server.peerId.toString();
+
+  console.log(`\n🚀 SwarmVault Relay running with PubSub!`);
+  console.log(`   Peer ID: ${peerId}`);
+  console.log(`\n📋 Copy this multiaddr into p2p.js bootstrap list:`);
+  server.getMultiaddrs().forEach((ma) => {
+    console.log(`   ${ma.toString()}`);
+  });
+  console.log(`\n   For Render deployment, use:`);
+  console.log(`   /dns/swarmvault-relay.onrender.com/tcp/443/wss/p2p/${peerId}\n`);
+}
+
+main().catch((err) => {
+  console.error('Failed to start relay server:', err);
+  process.exit(1);
+});

@@ -33,8 +33,27 @@ export async function encryptAndShard(file, chunkSize = 1024 * 1024) {
 
   const exportedKey = await window.crypto.subtle.exportKey('jwk', key);
   
-  // Permanent base64 thumbnail string for persistence across reloads
-  const thumbnail = file.type.startsWith('image/') ? await fileToBase64(file) : null;
+  // Create a tiny thumbnail (max 200x200) so it doesn't break Firestore's 1MB limit
+  const generateThumbnail = (file) => new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const MAX = 200;
+        let { width, height } = img;
+        if (width > height && width > MAX) { height *= MAX / width; width = MAX; }
+        else if (height > MAX) { width *= MAX / height; height = MAX; }
+        canvas.width = width; canvas.height = height;
+        canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', 0.6));
+      };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+  
+  const thumbnail = file.type.startsWith('image/') ? await generateThumbnail(file) : null;
   const mimeType = file.type;
 
   // Convert IV to a normal array so JSON.stringify doesn't mangle it

@@ -8,13 +8,210 @@ import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
 import { identify } from '@libp2p/identify';
 import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
 import { bootstrap } from '@libp2p/bootstrap';
-import { pipe } from 'it-pipe';
+
+// ─── Constants ───
+const RELAY_PEER_ID = '12D3KooWAQhWksCm5kE41QFg1D4yEyWQEY7Ed4BFrGA5pDt955xJ';
 
 let libp2pNode;
 let activePeers = new Map();
-const LOCAL_CHUNK_STORE = new Map();
 
-export async function initP2PNode(onPeerDiscovered, onPeerLost) {
+// ─── Signaling WebSocket (the REAL data channel) ───
+let signalingWs = null;
+let localPeerId = null;
+const pendingChunkRequests = new Map(); // chunkId -> { resolve, reject, timeout }
+let onFileSharedCallback = null; // callback when a peer shares a file with us
+
+// ─── Hosted Chunks Store (chunks this device stores for OTHER peers) ───
+const HOSTED_CHUNKS = new Map();
+
+// ─── IndexedDB helpers ───
+function getDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('SwarmVaultDB', 2);
+    request.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('chunks')) {
+        db.createObjectStore('chunks');
+      }
+      if (!db.objectStoreNames.contains('hosted')) {
+        db.createObjectStore('hosted');
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// ─── Connect to Signaling + Data Relay Server ───
+function connectSignalingServer(peerId, onPeerDiscovered, onPeerLost, onFileReceived) {
+  onFileSharedCallback = onFileReceived;
+  const wsHost = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
+  const signalingUrl = `ws://${wsHost}:10001`;
+  
+  localPeerId = peerId;
+  signalingWs = new WebSocket(signalingUrl);
+  
+  signalingWs.onopen = () => {
+    console.log('📡 Connected to Signaling + Data Relay Server');
+    // Announce ourselves
+    signalingWs.send(JSON.stringify({ type: 'announce', peerId }));
+    
+    // Keep-alive heartbeat
+    setInterval(() => {
+      if (signalingWs.readyState === WebSocket.OPEN) {
+        signalingWs.send(JSON.stringify({ type: 'announce', peerId }));
+      }
+    }, 15000);
+  };
+
+  signalingWs.onmessage = async (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      
+      switch (msg.type) {
+        case 'peer-joined': {
+          const pid = msg.peerId;
+          if (pid !== peerId && pid !== RELAY_PEER_ID && !activePeers.has(pid)) {
+            activePeers.set(pid, pid);
+            if (onPeerDiscovered) onPeerDiscovered(pid);
+            console.log('✅ Real peer connected:', pid.slice(-8));
+          }
+          break;
+        }
+        
+        case 'peer-left': {
+          const pid = msg.peerId;
+          if (activePeers.has(pid)) {
+            activePeers.delete(pid);
+            if (onPeerLost) onPeerLost(pid);
+            console.log('👋 Peer disconnected:', pid.slice(-8));
+          }
+          break;
+        }
+        
+        // Another peer sent us a chunk to host
+        case 'receive-chunk': {
+          const { chunkId, data, fromPeerId } = msg;
+          const chunkData = base64ToUint8Array(data);
+          HOSTED_CHUNKS.set(chunkId, chunkData);
+          
+          // Persist to IndexedDB
+          try {
+            const db = await getDB();
+            await new Promise((resolve) => {
+              const tx = db.transaction('hosted', 'readwrite');
+              tx.objectStore('hosted').put(chunkData, chunkId);
+              tx.oncomplete = resolve;
+            });
+          } catch (e) {}
+          
+          console.log(`📦 Hosting chunk ${chunkId.slice(-12)} from peer ${fromPeerId?.slice(-8)} (${chunkData.byteLength} bytes)`);
+          break;
+        }
+        
+        // Server is asking us if we have a chunk someone else needs
+        case 'find-chunk': {
+          const { chunkId, requesterId } = msg;
+          let chunkData = HOSTED_CHUNKS.get(chunkId);
+          
+          if (!chunkData) {
+            try {
+              const db = await getDB();
+              chunkData = await new Promise(resolve => {
+                const req = db.transaction('hosted').objectStore('hosted').get(chunkId);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => resolve(null);
+              });
+            } catch (e) {}
+          }
+          
+          // Also check local chunks store
+          if (!chunkData) {
+            try {
+              const db = await getDB();
+              chunkData = await new Promise(resolve => {
+                const req = db.transaction('chunks').objectStore('chunks').get(chunkId);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => resolve(null);
+              });
+            } catch (e) {}
+          }
+          
+          if (chunkData) {
+            signalingWs.send(JSON.stringify({
+              type: 'chunk-found',
+              chunkId,
+              data: uint8ArrayToBase64(new Uint8Array(chunkData)),
+              requesterId
+            }));
+            console.log(`📤 Served chunk ${chunkId.slice(-12)} to peer ${requesterId?.slice(-8)}`);
+          }
+          break;
+        }
+        
+        // Response to our chunk request
+        case 'chunk-response': {
+          const { chunkId, data, found } = msg;
+          const pending = pendingChunkRequests.get(chunkId);
+          if (pending) {
+            clearTimeout(pending.timeout);
+            pendingChunkRequests.delete(chunkId);
+            if (found && data) {
+              pending.resolve(base64ToUint8Array(data));
+            } else {
+              pending.resolve(null);
+            }
+          }
+          break;
+        }
+        
+        // Another peer shared a file with us
+        case 'file-shared': {
+          const { fileInfo, fromPeerId } = msg;
+          console.log(`📂 Received shared file "${fileInfo.name}" from peer ${fromPeerId?.slice(-8)}`);
+          if (onFileSharedCallback) {
+            onFileSharedCallback(fileInfo, fromPeerId);
+          }
+          break;
+        }
+      }
+    } catch (e) {
+      // Ignore parse errors
+    }
+  };
+  
+  signalingWs.onerror = (err) => {
+    console.warn('⚠️ Signaling server connection error. Make sure relay.js is running.');
+  };
+  
+  signalingWs.onclose = () => {
+    console.warn('⚠️ Signaling server disconnected. Attempting reconnect in 3s...');
+    setTimeout(() => connectSignalingServer(peerId, onPeerDiscovered, onPeerLost, onFileReceived), 3000);
+  };
+}
+
+// ─── Base64 helpers for WebSocket chunk transport ───
+function uint8ArrayToBase64(uint8Array) {
+  let binary = '';
+  const len = uint8Array.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(uint8Array[i]);
+  }
+  return btoa(binary);
+}
+
+function base64ToUint8Array(base64) {
+  const binary = atob(base64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+// ─── Init P2P Node ───
+export async function initP2PNode(onPeerDiscovered, onPeerLost, onFileReceived) {
   libp2pNode = await createLibp2p({
     addresses: {
       listen: ['/webrtc']
@@ -27,13 +224,15 @@ export async function initP2PNode(onPeerDiscovered, onPeerLost) {
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
     services: {
-      pubsub: gossipsub(),
+      pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
       identify: identify()
     },
     peerDiscovery: [
       bootstrap({
         list: [
-          '/dns/swarmvault-relay.onrender.com/tcp/443/wss'
+          typeof window !== 'undefined' 
+            ? `/ip4/${window.location.hostname === 'localhost' ? '127.0.0.1' : window.location.hostname}/tcp/10000/ws/p2p/${RELAY_PEER_ID}`
+            : `/ip4/127.0.0.1/tcp/10000/ws/p2p/${RELAY_PEER_ID}`
         ]
       }),
       pubsubPeerDiscovery({
@@ -42,546 +241,197 @@ export async function initP2PNode(onPeerDiscovered, onPeerLost) {
     ]
   });
 
-  registerSilentStorageReceiver(libp2pNode);
-
-  libp2pNode.addEventListener('peer:discovery', (evt) => {
-    const peerId = evt.detail.id;
-    if (onPeerDiscovered) onPeerDiscovered(peerId);
-    activePeers.set(peerId.toString(), peerId);
-    console.log('Discovered peer:', peerId.toString());
-  });
-
-  libp2pNode.addEventListener('peer:disconnect', (evt) => {
-    const peerId = evt.detail.id;
-    if (onPeerLost) onPeerLost(peerId);
-    activePeers.delete(peerId.toString());
-  });
-
   await libp2pNode.start();
-  console.log('P2P Node started with ID:', libp2pNode.peerId.toString());
+  
+  const myPeerId = libp2pNode.peerId.toString();
+  console.log('🔐 P2P Node started with ID:', myPeerId);
+
+  // Connect to the signaling + data relay server for REAL peer discovery and data transfer
+  connectSignalingServer(myPeerId, onPeerDiscovered, onPeerLost, onFileReceived);
 
   return libp2pNode;
 }
 
-export function registerSilentStorageReceiver(node) {
-  node.handle('/swarmvault/chunk/1.0.0', async ({ stream }) => {
-    try {
-      await pipe(
-        stream.source,
-        async function (source) {
-          for await (const chunk of source) {
-            const chunkKey = Math.random().toString();
-            LOCAL_CHUNK_STORE.set(chunkKey, chunk.subarray());
-          }
-        }
-      );
-    } catch (err) {
-      console.error('Error receiving chunk:', err);
-    }
-  });
-}
-
-function getDB() {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open('SwarmVaultDB', 1);
-    request.onupgradeneeded = (e) => e.target.result.createObjectStore('chunks');
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  });
-}
-
-export async function distributeChunks(node, chunks, peersMap) {
+// ─── Distribute chunks to peers via signaling relay ───
+export async function distributeChunks(node, chunks, peerIdStrings) {
   const distributionManifest = {};
-  const peerIds = Array.from(peersMap.values());
   const db = await getDB();
+  
+  // Filter to real peers only
+  const realPeers = peerIdStrings.filter(p => p !== 'local-network-mock' && p !== RELAY_PEER_ID);
+  const hasRealPeers = realPeers.length > 0 && signalingWs && signalingWs.readyState === WebSocket.OPEN;
 
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
-    
-    if (peerIds.length === 0 || peerIds[0] === 'local-network-mock') {
-      const fallbackKey = `simulated-peer-chunk-${Date.now()}-${i}`;
-      await new Promise((resolve) => {
-        const tx = db.transaction('chunks', 'readwrite');
-        tx.objectStore('chunks').put(chunk, fallbackKey);
-        tx.oncomplete = resolve;
-      });
-      distributionManifest[i] = fallbackKey;
-      continue;
+    const chunkId = `chunk-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 8)}`;
+
+    // Always store locally first (as backup)
+    await new Promise((resolve) => {
+      const tx = db.transaction('chunks', 'readwrite');
+      tx.objectStore('chunks').put(chunk, chunkId);
+      tx.oncomplete = resolve;
+    });
+
+    if (hasRealPeers) {
+      // Distribute to a real peer via the signaling relay
+      const targetPeer = realPeers[i % realPeers.length];
+      
+      try {
+        const base64Data = uint8ArrayToBase64(chunk);
+        signalingWs.send(JSON.stringify({
+          type: 'store-chunk',
+          chunkId,
+          data: base64Data,
+          targetPeerId: targetPeer
+        }));
+        
+        distributionManifest[i] = `peer:${targetPeer}:${chunkId}`;
+        console.log(`📤 Distributed chunk ${i} (${chunk.byteLength} bytes) to peer ${targetPeer.slice(-8)}`);
+        continue;
+      } catch (err) {
+        console.warn(`⚠️ Could not distribute chunk ${i} to peer, storing locally:`, err.message);
+      }
     }
 
-    const targetPeer = peerIds[i % peerIds.length];
-    try {
-      const connection = await node.dial(targetPeer);
-      const stream = await connection.newStream('/swarmvault/chunk/1.0.0');
-      await pipe([chunk], stream.sink);
-      distributionManifest[i] = targetPeer.toString();
-    } catch (err) {
-      const fallbackKey = `local-fallback-${Date.now()}-${i}`;
-      const tx = db.transaction('chunks', 'readwrite');
-      tx.objectStore('chunks').put(chunk, fallbackKey);
-      distributionManifest[i] = fallbackKey;
-    }
+    // No peers or send failed — local-only
+    distributionManifest[i] = chunkId;
   }
+
   return distributionManifest;
 }
 
+// ─── Fetch chunks back for retrieval ───
 export async function fetchChunks(node, manifest) {
   const retrievedChunks = [];
   const db = await getDB();
 
-  for (const [chunkIndex, peerIdStr] of Object.entries(manifest)) {
-    const localChunk = await new Promise(resolve => {
-       const req = db.transaction('chunks').objectStore('chunks').get(peerIdStr);
-       req.onsuccess = () => resolve(req.result);
-       req.onerror = () => resolve(null);
-    });
+  for (const [chunkIndex, locationStr] of Object.entries(manifest)) {
+    // Case 1: Chunk is on a remote peer
+    if (locationStr.startsWith('peer:')) {
+      const parts = locationStr.split(':');
+      const peerIdStr = parts[1];
+      const chunkId = parts.slice(2).join(':');
 
-    if (localChunk) {
-      retrievedChunks.push(localChunk);
+      // Try fetching from the relay server first
+      if (signalingWs && signalingWs.readyState === WebSocket.OPEN) {
+        try {
+          const chunkData = await requestChunkFromRelay(chunkId);
+          if (chunkData) {
+            retrievedChunks.push(chunkData);
+            console.log(`✅ Retrieved chunk ${chunkIndex} from relay/peers`);
+            continue;
+          }
+        } catch (err) {
+          console.warn(`⚠️ Relay fetch failed for chunk ${chunkIndex}:`, err.message);
+        }
+      }
+
+      // Fallback: try local IndexedDB
+      const localChunk = await new Promise(resolve => {
+        const req = db.transaction('chunks').objectStore('chunks').get(chunkId);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => resolve(null);
+      });
+      if (localChunk) {
+        retrievedChunks.push(new Uint8Array(localChunk));
+        console.log(`📂 Retrieved chunk ${chunkIndex} from local backup`);
+        continue;
+      }
+
+      console.error(`❌ Could not retrieve chunk ${chunkIndex} — peer offline and no local copy`);
       continue;
     }
 
-    try {
-      const peerId = activePeers.get(peerIdStr);
-      if (!peerId) throw new Error(`Peer not connected`);
-      const connection = await node.dial(peerId);
-      const stream = await connection.newStream('/swarmvault/chunk/1.0.0');
-      retrievedChunks.push(new Uint8Array()); 
-    } catch (err) {
-      console.error(`Failed to fetch chunk from ${peerIdStr}:`, err);
+    // Case 2: Chunk is stored locally in IndexedDB
+    const localChunk = await new Promise(resolve => {
+      const req = db.transaction('chunks').objectStore('chunks').get(locationStr);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    });
+
+    if (localChunk) {
+      retrievedChunks.push(new Uint8Array(localChunk));
+    } else {
+      console.error(`❌ Missing local chunk: ${locationStr}`);
     }
   }
+
   return retrievedChunks;
 }
 
-//  works 
-// import { createLibp2p } from 'libp2p';
-// import { webSockets } from '@libp2p/websockets';
-// import { webRTC } from '@libp2p/webrtc';
-// import { noise } from '@chainsafe/libp2p-noise';
-// import { yamux } from '@chainsafe/libp2p-yamux';
-// import { gossipsub } from '@chainsafe/libp2p-gossipsub';
-// import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
-// import { identify } from '@libp2p/identify';
-// // import { circuitRelayTransport } from 'libp2p/circuit-relay';
-// import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
-// import { pipe } from 'it-pipe';
-
-// import { multiaddr } from '@multiformats/multiaddr';
-
-// let libp2pNode;
-// let activePeers = new Map();
-// const LOCAL_CHUNK_STORE = new Map(); // Local silent storage bucket
-
-// export async function initP2PNode(onPeerDiscovered, onPeerLost) {
-//   libp2pNode = await createLibp2p({
-//     addresses: {
-//     //   listen: ['/ip4/127.0.0.1/tcp/0/ws']
-//     listen: ['/webrtc']
-//     },
-//     transports: [
-//       webSockets(),
-//       webRTC(),
-//       circuitRelayTransport()
-//     ],
-//     connectionEncrypters: [noise()],
-//     streamMuxers: [yamux()],
-//     services: {
-//       pubsub: gossipsub(),
-//       identify: identify()
-//     },
-//     peerDiscovery: [
-//       pubsubPeerDiscovery({
-//         topics: ['swarmvault-discovery']
-//       })
-//     ]
-//   });
-
-//   // Register the silent storage receiver protocol listener on startup
-//   registerSilentStorageReceiver(libp2pNode);
-
-//   libp2pNode.addEventListener('peer:discovery', (evt) => {
-//     const peerId = evt.detail.id;
-//     if (onPeerDiscovered) onPeerDiscovered(peerId);
-//     activePeers.set(peerId.toString(), peerId);
-//   });
-
-//   libp2pNode.addEventListener('peer:disconnect', (evt) => {
-//     const peerId = evt.detail.id;
-//     if (onPeerLost) onPeerLost(peerId);
-//     activePeers.delete(peerId.toString());
-//   });
-
-
-//   await libp2pNode.start();
-//   console.log('P2P Node started with ID:', libp2pNode.peerId.toString());
-
-//   // Connect to your live Render cloud relay server
-//   try {
-//     await libp2pNode.dial(multiaddr('/dns/swarmvault-relay.onrender.com/tcp/443/wss'));
-//     console.log('Connected to SwarmVault Cloud Relay!');
-//   } catch (e) {
-//     console.log('Cloud relay unreachable, running standalone/discovery mode.', e);
-//   }
-
-//   return libp2pNode;
-
-// }
-
-// export function registerSilentStorageReceiver(node) {
-//   node.handle('/swarmvault/chunk/1.0.0', async ({ stream }) => {
-//     try {
-//       await pipe(
-//         stream.source,
-//         async function (source) {
-//           for await (const chunk of source) {
-//             // Save received shard into local silent storage
-//             const chunkKey = Math.random().toString();
-//             LOCAL_CHUNK_STORE.set(chunkKey, chunk.subarray());
-//           }
-//         }
-//       );
-//     } catch (err) {
-//       console.error('Error receiving chunk:', err);
-//     }
-//   });
-// }
-
-// // --- NEW DATABASE HELPER ---
-// function getDB() {
-//   return new Promise((resolve, reject) => {
-//     const request = indexedDB.open('SwarmVaultDB', 1);
-//     request.onupgradeneeded = (e) => e.target.result.createObjectStore('chunks');
-//     request.onsuccess = () => resolve(request.result);
-//     request.onerror = () => reject(request.error);
-//   });
-// }
-
-// export async function distributeChunks(node, chunks, peersMap) {
-//   const distributionManifest = {};
-//   const peerIds = Array.from(peersMap.values());
-//   const db = await getDB();
-
-//   for (let i = 0; i < chunks.length; i++) {
-//     const chunk = chunks[i];
+// ─── Request a chunk from the relay server ───
+function requestChunkFromRelay(chunkId) {
+  return new Promise((resolve, reject) => {
+    if (!signalingWs || signalingWs.readyState !== WebSocket.OPEN) {
+      return resolve(null);
+    }
     
-//     // If no real peers, store in local IndexedDB
-//     if (peerIds.length === 0 || peerIds[0] === 'local-network-mock') {
-//       const fallbackKey = `simulated-peer-chunk-${Date.now()}-${i}`;
-//       await new Promise((resolve) => {
-//         const tx = db.transaction('chunks', 'readwrite');
-//         tx.objectStore('chunks').put(chunk, fallbackKey);
-//         tx.oncomplete = resolve;
-//       });
-//       distributionManifest[i] = fallbackKey;
-//       continue;
-//     }
-
-//     const targetPeer = peerIds[i % peerIds.length];
-//     try {
-//       const connection = await node.dial(targetPeer);
-//       const stream = await connection.newStream('/swarmvault/chunk/1.0.0');
-//       await pipe([chunk], stream.sink);
-//       distributionManifest[i] = targetPeer.toString();
-//     } catch (err) {
-//       // Fallback to local DB if network fails
-//       const fallbackKey = `local-fallback-${Date.now()}-${i}`;
-//       const tx = db.transaction('chunks', 'readwrite');
-//       tx.objectStore('chunks').put(chunk, fallbackKey);
-//       distributionManifest[i] = fallbackKey;
-//     }
-//   }
-//   return distributionManifest;
-// }
-
-// export async function fetchChunks(node, manifest) {
-//   const retrievedChunks = [];
-//   const db = await getDB();
-
-//   for (const [chunkIndex, peerIdStr] of Object.entries(manifest)) {
-//     // Check local permanent database first
-//     const localChunk = await new Promise(resolve => {
-//        const req = db.transaction('chunks').objectStore('chunks').get(peerIdStr);
-//        req.onsuccess = () => resolve(req.result);
-//        req.onerror = () => resolve(null);
-//     });
-
-//     if (localChunk) {
-//       retrievedChunks.push(localChunk);
-//       continue;
-//     }
-
-//     // Otherwise fetch from swarm
-//     try {
-//       const peerId = activePeers.get(peerIdStr);
-//       if (!peerId) throw new Error(`Peer not connected`);
-//       const connection = await node.dial(peerId);
-//       const stream = await connection.newStream('/swarmvault/chunk/1.0.0');
-//       retrievedChunks.push(new Uint8Array()); 
-//     } catch (err) {
-//       console.error(`Failed to fetch chunk from ${peerIdStr}:`, err);
-//     }
-//   }
-//   return retrievedChunks;
-// }
-
-
-
-
-// moving to permanent data base from ram to indexdb
-// export async function distributeChunks(node, chunks, peersMap) {
-//   const distributionManifest = {};
-//   const peerIds = Array.from(peersMap.values());
-
-//   for (let i = 0; i < chunks.length; i++) {
-//     const chunk = chunks[i];
+    const timeout = setTimeout(() => {
+      pendingChunkRequests.delete(chunkId);
+      resolve(null); // Timeout — chunk not found
+    }, 5000);
     
-//     // Simulated swarm fallback for single-node testing
-//     if (peerIds.length === 0 || peerIds[0] === 'local-network-mock') {
-//       const fallbackKey = `simulated-peer-chunk-${i}`;
-//       LOCAL_CHUNK_STORE.set(fallbackKey, chunk);
-//       distributionManifest[i] = fallbackKey;
-//       continue;
-//     }
+    pendingChunkRequests.set(chunkId, { resolve, reject, timeout });
+    
+    signalingWs.send(JSON.stringify({
+      type: 'request-chunk',
+      chunkId
+    }));
+  });
+}
 
-//     const targetPeer = peerIds[i % peerIds.length];
-//     try {
-//       const connection = await node.dial(targetPeer);
-//       const stream = await connection.newStream('/swarmvault/chunk/1.0.0');
-      
-//       await pipe([chunk], stream.sink);
-//       distributionManifest[i] = targetPeer.toString();
-//     } catch (err) {
-//       // If network fails, save locally so we don't lose the shard
-//       const fallbackKey = `local-fallback-${i}`;
-//       LOCAL_CHUNK_STORE.set(fallbackKey, chunk);
-//       distributionManifest[i] = fallbackKey;
-//     }
-//   }
+// ─── Hosted Chunk Stats (for proof-of-hosting UI) ───
+export function getHostedChunkStats() {
+  let totalBytes = 0;
+  for (const chunk of HOSTED_CHUNKS.values()) {
+    totalBytes += chunk.byteLength || chunk.length || 0;
+  }
+  return {
+    count: HOSTED_CHUNKS.size,
+    totalBytes,
+  };
+}
 
-//   return distributionManifest;
-// }
+// Load persisted hosted chunks from IndexedDB on startup
+export async function loadHostedChunksFromDB() {
+  try {
+    const db = await getDB();
+    return new Promise((resolve) => {
+      const tx = db.transaction('hosted', 'readonly');
+      const store = tx.objectStore('hosted');
+      const cursorReq = store.openCursor();
+      let loaded = 0;
 
-// export async function fetchChunks(node, manifest) {
-//   const retrievedChunks = [];
+      cursorReq.onsuccess = (e) => {
+        const cursor = e.target.result;
+        if (cursor) {
+          HOSTED_CHUNKS.set(cursor.key, cursor.value);
+          loaded++;
+          cursor.continue();
+        } else {
+          console.log(`📂 Loaded ${loaded} hosted chunks from IndexedDB`);
+          resolve(loaded);
+        }
+      };
+      cursorReq.onerror = () => resolve(0);
+    });
+  } catch (e) {
+    console.warn('Could not load hosted chunks from IndexedDB:', e);
+    return 0;
+  }
+}
 
-//   for (const [chunkIndex, peerIdStr] of Object.entries(manifest)) {
-//     // Check our local simulated network store first
-//     if (LOCAL_CHUNK_STORE.has(peerIdStr)) {
-//       retrievedChunks.push(LOCAL_CHUNK_STORE.get(peerIdStr));
-//       continue;
-//     }
+// ─── Share a file's metadata with all connected peers ───
+export function shareFileToNetwork(fileInfo) {
+  if (signalingWs && signalingWs.readyState === WebSocket.OPEN) {
+    signalingWs.send(JSON.stringify({
+      type: 'share-file',
+      fileInfo
+    }));
+    console.log(`📤 Shared file "${fileInfo.name}" with network peers`);
+  } else {
+    console.warn('Cannot share file — not connected to signaling server');
+  }
+}
 
-//     try {
-//       const peerId = activePeers.get(peerIdStr);
-//       if (!peerId) throw new Error(`Peer not connected`);
-
-//       const connection = await node.dial(peerId);
-//       const stream = await connection.newStream('/swarmvault/chunk/1.0.0');
-
-//       // Network stream logic placeholder for multi-node retrieval
-//       retrievedChunks.push(new Uint8Array()); 
-//     } catch (err) {
-//       console.error(`Failed to fetch chunk from ${peerIdStr}:`, err);
-//     }
-//   }
-
-//   return retrievedChunks;
-// }
-
-
-
-// if no peers are available the 16 bit code give a error above it is solved 
-// export async function distributeChunks(node, chunks, peersMap) {
-//   const distributionManifest = {};
-//   const peerIds = Array.from(peersMap.values());
-
-//   if (peerIds.length === 0) {
-//     throw new Error('No active peers available in the swarm to distribute chunks!');
-//   }
-
-//   for (let i = 0; i < chunks.length; i++) {
-//     const chunk = chunks[i];
-//     const targetPeer = peerIds[i % peerIds.length];
-
-//     try {
-//       const connection = await node.dial(targetPeer);
-//       const stream = await connection.newStream('/swarmvault/chunk/1.0.0');
-
-//       await pipe(
-//         [chunk],
-//         stream.sink
-//       );
-
-//       distributionManifest[i] = targetPeer.toString();
-//     } catch (err) {
-//       console.error(`Failed to send chunk to peer ${targetPeer.toString()}:`, err);
-//     }
-//   }
-
-//   return distributionManifest;
-// }
-
-// export async function fetchChunks(node, manifest) {
-//   const retrievedChunks = [];
-
-//   for (const [chunkIndex, peerIdStr] of Object.entries(manifest)) {
-//     // If stored locally in our own node store
-//     if (LOCAL_CHUNK_STORE.has(chunkIndex)) {
-//       retrievedChunks.push(LOCAL_CHUNK_STORE.get(chunkIndex));
-//       continue;
-//     }
-
-//     try {
-//       const peerId = activePeers.get(peerIdStr);
-//       if (!peerId) throw new Error(`Peer ${peerIdStr} not connected`);
-
-//       const connection = await node.dial(peerId);
-//       const stream = await connection.newStream('/swarmvault/chunk/1.0.0');
-
-//       // Request stream logic placeholder for retrieval
-//       retrievedChunks.push(new Uint8Array()); 
-//     } catch (err) {
-//       console.error(`Failed to fetch chunk from ${peerIdStr}:`, err);
-//     }
-//   }
-
-//   return retrievedChunks;
-// }
-
-
-//  didnt worked well 
-// import { identify } from '@libp2p/identify';
-// import { createLibp2p } from 'libp2p';
-// import { webSockets } from '@libp2p/websockets';
-// import { webRTC } from '@libp2p/webrtc';
-// import { noise } from '@chainsafe/libp2p-noise';
-// import { yamux } from '@chainsafe/libp2p-yamux';
-// import { gossipsub } from '@chainsafe/libp2p-gossipsub';
-// import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
-// import { pipe } from 'it-pipe';
-
-// let libp2pNode;
-// let activePeers = new Map();
-// const LOCAL_CHUNK_STORE = new Map();
-
-// export async function initP2PNode(onPeerDiscovered, onPeerLost) {
-//   libp2pNode = await createLibp2p({
-//     addresses: {
-//       listen: ['/ip4/127.0.0.1/tcp/0/ws']
-//     },
-//     transports: [
-//       webSockets(),
-//       webRTC()
-//     ],
-//     connectionEncrypters: [noise()],
-//     streamMuxers: [yamux()],
-//     services: {
-//       pubsub: gossipsub(),
-//       identify: identify()
-//     },
-//     peerDiscovery: [
-//       pubsubPeerDiscovery({
-//         topics: ['swarmvault-discovery']
-//       })
-//     ]
-//   });
-
-//   registerSilentStorageReceiver(libp2pNode);
-
-//   libp2pNode.addEventListener('peer:discovery', (evt) => {
-//     const peerId = evt.detail.id;
-//     if (onPeerDiscovered) onPeerDiscovered(peerId);
-//     activePeers.set(peerId.toString(), peerId);
-//   });
-
-//   libp2pNode.addEventListener('peer:disconnect', (evt) => {
-//     const peerId = evt.detail.id;
-//     if (onPeerLost) onPeerLost(peerId);
-//     activePeers.delete(peerId.toString());
-//   });
-
-//   await libp2pNode.start();
-//   console.log('P2P Node started with ID:', libp2pNode.peerId.toString());
-
-//   try {
-//     await libp2pNode.dial('/ip4/127.0.0.1/tcp/9090/ws');
-//   } catch (e) {
-//     console.log('Relay server not active yet, running standalone/discovery mode.');
-//   }
-
-//   return libp2pNode;
-// }
-
-// export function registerSilentStorageReceiver(node) {
-//   node.handle('/swarmvault/chunk/1.0.0', async ({ stream }) => {
-//     try {
-//       await pipe(
-//         stream.source,
-//         async function (source) {
-//           for await (const chunk of source) {
-//             const chunkKey = Math.random().toString();
-//             LOCAL_CHUNK_STORE.set(chunkKey, chunk.subarray());
-//           }
-//         }
-//       );
-//     } catch (err) {
-//       console.error('Error receiving chunk:', err);
-//     }
-//   });
-// }
-
-// export async function distributeChunks(node, chunks, peersMap) {
-//   const distributionManifest = {};
-//   const peerIds = Array.from(peersMap.values());
-
-//   if (peerIds.length === 0) {
-//     throw new Error('No active peers available in the swarm to distribute chunks!');
-//   }
-
-//   for (let i = 0; i < chunks.length; i++) {
-//     const chunk = chunks[i];
-//     const targetPeer = peerIds[i % peerIds.length];
-
-//     try {
-//       const connection = await node.dial(targetPeer);
-//       const stream = await connection.newStream('/swarmvault/chunk/1.0.0');
-
-//       await pipe(
-//         [chunk],
-//         stream.sink
-//       );
-
-//       distributionManifest[i] = targetPeer.toString();
-//     } catch (err) {
-//       console.error(`Failed to send chunk to peer ${targetPeer.toString()}:`, err);
-//     }
-//   }
-
-//   return distributionManifest;
-// }
-
-// export async function fetchChunks(node, manifest) {
-//   const retrievedChunks = [];
-
-//   for (const [chunkIndex, peerIdStr] of Object.entries(manifest)) {
-//     if (LOCAL_CHUNK_STORE.has(chunkIndex)) {
-//       retrievedChunks.push(LOCAL_CHUNK_STORE.get(chunkIndex));
-//       continue;
-//     }
-
-//     try {
-//       const peerId = activePeers.get(peerIdStr);
-//       if (!peerId) throw new Error(`Peer ${peerIdStr} not connected`);
-
-//       const connection = await node.dial(peerId);
-//       const stream = await connection.newStream('/swarmvault/chunk/1.0.0');
-
-//       retrievedChunks.push(new Uint8Array()); 
-//     } catch (err) {
-//       console.error(`Failed to fetch chunk from ${peerIdStr}:`, err);
-//     }
-//   }
-
-//   return retrievedChunks;
-// }
+export { RELAY_PEER_ID };
