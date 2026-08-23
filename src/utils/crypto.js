@@ -16,6 +16,14 @@ export class VaultLockedError extends Error {
 
 let cachedVaultKey = null;
 
+/**
+ * Drops the in-memory key so the next read comes from localStorage. Exported so
+ * a caller swapping keys can guarantee nothing is still holding the old one.
+ */
+export function invalidateVaultKeyCache() {
+  cachedVaultKey = null;
+}
+
 function readStoredJwk() {
   try {
     const raw = localStorage.getItem(VAULT_KEY_STORAGE);
@@ -137,6 +145,12 @@ export async function importVaultKey(input) {
   }
 
   const normalized = await window.crypto.subtle.exportKey('jwk', key);
+
+  // Commit the swap as one step. The cache is dropped *first* so no concurrent
+  // decrypt can pick up the outgoing key mid-swap. If the write below fails,
+  // cachedVaultKey stays null and the next getVaultKey() reloads the previous
+  // key from storage — the swap rolls back cleanly instead of half-applying.
+  cachedVaultKey = null;
   try {
     localStorage.setItem(VAULT_KEY_STORAGE, JSON.stringify(normalized));
   } catch (e) {
@@ -232,6 +246,9 @@ export async function hydrateFileRecord(record) {
       size: typeof meta.size === 'number' ? meta.size : null,
       mimeType: typeof meta.mimeType === 'string' ? meta.mimeType : null,
       vaultLocked: false,
+      // Cleared explicitly: re-hydrating a previously sealed record after a key
+      // import must not leave the old "wrong key" reason attached to it.
+      lockedReason: null,
     };
   } catch (e) {
     return {
@@ -243,6 +260,19 @@ export async function hydrateFileRecord(record) {
       lockedReason: e.message,
     };
   }
+}
+
+/**
+ * Re-runs hydration over a list of records against whatever key is current.
+ * Called straight after a key import: records the new key opens stop being
+ * sealed and records it can't read start being sealed, with no page reload.
+ * Purely in-memory, so it works even when the network is unavailable.
+ */
+export async function rehydrateFileRecords(records) {
+  if (!Array.isArray(records)) return [];
+  // One explicit argument — map() would otherwise pass index and array through.
+  const hydrated = await Promise.all(records.map((record) => hydrateFileRecord(record)));
+  return hydrated.filter(Boolean);
 }
 
 /**

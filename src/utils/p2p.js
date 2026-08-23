@@ -52,10 +52,35 @@ let onFileSharedCallback = null; // callback when a peer shares a file with us
 // ─── Hosted Chunks Store (chunks this device stores for OTHER peers) ───
 const HOSTED_CHUNKS = new Map();
 
+// Provenance for each hosted chunk. The chunk id alone can't say who sent it,
+// so the diagnostic table would have nothing real to show in an Origin column.
+const HOSTED_META = new Map(); // chunkId -> { fromPeerId, receivedAt, bytes }
+
+// ─── Pending Distribution (offline-first uploads) ───
+// A file uploaded while no peer is connected is still encrypted and chunked,
+// but its chunks park here in local IndexedDB until a real peer shows up.
+const PENDING_CHUNKS = new Map(); // chunkId -> { index, createdAt, bytes }
+let isFlushingPending = false;
+
+// Handing a chunk to a peer and then keeping a local mirror would mean the node
+// never reclaims anything, so the local copy is released after a successful
+// handoff. The trade-off: `store-chunk` is fire-and-forget over the relay, so
+// there is no delivery receipt to wait for. Set this to false to keep the
+// mirror — retrieval still works either way, since a `peer:` manifest entry
+// falls back to the local `chunks` store when the peer is unreachable.
+const FREE_LOCAL_COPY_AFTER_HANDOFF = true;
+
+let onHostedChunkAddedCallback = null;   // fires the instant a chunk arrives
+let onPendingDistributedCallback = null; // fires after a delayed handoff
+
+// v3 adds `hostedMeta` (who sent each hosted chunk) and `pending` (the
+// offline-first queue). Existing `chunks` / `hosted` data is left untouched.
+const DB_VERSION = 3;
+
 // ─── IndexedDB helpers ───
 function getDB() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open('SwarmVaultDB', 2);
+    const request = indexedDB.open('SwarmVaultDB', DB_VERSION);
     request.onupgradeneeded = (e) => {
       const db = e.target.result;
       if (!db.objectStoreNames.contains('chunks')) {
@@ -64,9 +89,63 @@ function getDB() {
       if (!db.objectStoreNames.contains('hosted')) {
         db.createObjectStore('hosted');
       }
+      if (!db.objectStoreNames.contains('hostedMeta')) {
+        db.createObjectStore('hostedMeta');
+      }
+      if (!db.objectStoreNames.contains('pending')) {
+        db.createObjectStore('pending');
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
+  });
+}
+
+// Chunk ids are minted as `chunk-<epoch-ms>-<index>-<rand>`, so anything stored
+// before `hostedMeta` existed still yields a usable arrival time.
+function chunkIdTimestamp(chunkId) {
+  const match = /^chunk-(\d{10,})-/.exec(String(chunkId));
+  return match ? Number(match[1]) : null;
+}
+
+// Small promisified store write/delete, used by the pending queue.
+function idbPut(db, storeName, value, key) {
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(storeName, 'readwrite');
+      tx.objectStore(storeName).put(value, key);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+      tx.onabort = () => resolve(false);
+    } catch (e) {
+      resolve(false);
+    }
+  });
+}
+
+function idbDelete(db, storeName, key) {
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(storeName, 'readwrite');
+      tx.objectStore(storeName).delete(key);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+      tx.onabort = () => resolve(false);
+    } catch (e) {
+      resolve(false);
+    }
+  });
+}
+
+function idbGet(db, storeName, key) {
+  return new Promise((resolve) => {
+    try {
+      const req = db.transaction(storeName).objectStore(storeName).get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch (e) {
+      resolve(null);
+    }
   });
 }
 
@@ -104,6 +183,11 @@ function connectSignalingServer(peerId, onPeerDiscovered, onPeerLost, onFileRece
             activePeers.set(pid, pid);
             if (onPeerDiscovered) onPeerDiscovered(pid);
             console.log('✅ Real peer connected:', pid.slice(-8));
+
+            // Offline-first handoff: anything uploaded while this node was
+            // isolated goes out to the peer that just arrived. Not awaited —
+            // a slow flush must not stall the rest of the message loop.
+            flushPendingChunks(pid);
           }
           break;
         }
@@ -122,19 +206,40 @@ function connectSignalingServer(peerId, onPeerDiscovered, onPeerLost, onFileRece
         case 'receive-chunk': {
           const { chunkId, data, fromPeerId } = msg;
           const chunkData = base64ToUint8Array(data);
+          const entry = {
+            fromPeerId: fromPeerId || null,
+            receivedAt: Date.now(),
+            bytes: chunkData.byteLength,
+          };
           HOSTED_CHUNKS.set(chunkId, chunkData);
-          
-          // Persist to IndexedDB
+          HOSTED_META.set(chunkId, entry);
+
+          // Persist to IndexedDB. `hosted` keeps raw bytes so the find-chunk
+          // path can hand them straight back; provenance rides alongside in
+          // `hostedMeta` rather than wrapping the bytes in an object.
           try {
             const db = await getDB();
             await new Promise((resolve) => {
-              const tx = db.transaction('hosted', 'readwrite');
+              const tx = db.transaction(['hosted', 'hostedMeta'], 'readwrite');
               tx.objectStore('hosted').put(chunkData, chunkId);
+              tx.objectStore('hostedMeta').put(entry, chunkId);
               tx.oncomplete = resolve;
+              tx.onerror = resolve;
+              tx.onabort = resolve;
             });
           } catch (e) {}
-          
+
           console.log(`📦 Hosting chunk ${chunkId.slice(-12)} from peer ${fromPeerId?.slice(-8)} (${chunkData.byteLength} bytes)`);
+
+          // Push the arrival straight to the UI so the diagnostic table updates
+          // the moment the chunk lands, instead of on the next poll.
+          if (onHostedChunkAddedCallback) {
+            try {
+              onHostedChunkAddedCallback({ chunkId, ...entry });
+            } catch (e) {
+              console.warn('onHostedChunkAdded handler threw:', e.message);
+            }
+          }
           break;
         }
         
@@ -240,7 +345,18 @@ function base64ToUint8Array(base64) {
 }
 
 // ─── Init P2P Node ───
-export async function initP2PNode(onPeerDiscovered, onPeerLost, onFileReceived) {
+// The two trailing callbacks are optional, so existing three-argument calls
+// keep working unchanged.
+export async function initP2PNode(
+  onPeerDiscovered,
+  onPeerLost,
+  onFileReceived,
+  onHostedChunkAdded,
+  onPendingDistributed
+) {
+  onHostedChunkAddedCallback = onHostedChunkAdded || null;
+  onPendingDistributedCallback = onPendingDistributed || null;
+
   libp2pNode = await createLibp2p({
     addresses: {
       listen: ['/webrtc']
@@ -322,8 +438,14 @@ export async function distributeChunks(node, chunks, peerIdStrings) {
       }
     }
 
-    // No peers or send failed — local-only
+    // No peers, or the send failed. The chunk stays local and joins the pending
+    // queue, so it can be offloaded the moment a real peer appears.
     distributionManifest[i] = chunkId;
+
+    const pendingEntry = { index: i, createdAt: Date.now(), bytes: chunk.byteLength };
+    PENDING_CHUNKS.set(chunkId, pendingEntry);
+    await idbPut(db, 'pending', pendingEntry, chunkId);
+    console.log(`🕗 Chunk ${i} (${chunk.byteLength} bytes) queued for delayed distribution`);
   }
 
   return distributionManifest;
@@ -409,6 +531,86 @@ function requestChunkFromRelay(chunkId) {
   });
 }
 
+// ─── Offline-first handoff ───
+// Runs the moment a real peer joins. Every chunk parked locally because the node
+// was isolated is pushed to that peer, then released locally so the node
+// reclaims the space. Returns the moves so the caller can rewrite its manifests.
+export async function flushPendingChunks(targetPeerId) {
+  if (isFlushingPending) return [];
+  if (!targetPeerId || targetPeerId === RELAY_PEER_ID) return [];
+  if (!signalingWs || signalingWs.readyState !== WebSocket.OPEN) return [];
+  if (PENDING_CHUNKS.size === 0) return [];
+
+  isFlushingPending = true;
+  const moved = [];
+
+  try {
+    const db = await getDB();
+    // Snapshot first — the map is mutated as the loop drains it.
+    const queued = Array.from(PENDING_CHUNKS.entries());
+    console.log(`🚚 Offloading ${queued.length} pending chunk(s) to peer ${targetPeerId.slice(-8)}...`);
+
+    for (const [chunkId, entry] of queued) {
+      // The bytes have been sitting in the local `chunks` store since upload.
+      const stored = await idbGet(db, 'chunks', chunkId);
+      if (!stored) {
+        // Nothing left to hand over — drop it rather than retrying forever.
+        PENDING_CHUNKS.delete(chunkId);
+        await idbDelete(db, 'pending', chunkId);
+        console.warn(`⚠️ Pending chunk ${chunkId.slice(-12)} has no local bytes — dropped from the queue`);
+        continue;
+      }
+
+      const bytes = new Uint8Array(stored);
+      try {
+        signalingWs.send(JSON.stringify({
+          type: 'store-chunk',
+          chunkId,
+          data: uint8ArrayToBase64(bytes),
+          targetPeerId,
+        }));
+      } catch (err) {
+        // Leave it queued so the next peer to join can try again.
+        console.warn(`⚠️ Handoff failed for ${chunkId.slice(-12)}, keeping it local:`, err.message);
+        continue;
+      }
+
+      PENDING_CHUNKS.delete(chunkId);
+      await idbDelete(db, 'pending', chunkId);
+
+      if (FREE_LOCAL_COPY_AFTER_HANDOFF) {
+        await idbDelete(db, 'chunks', chunkId);
+      }
+
+      moved.push({
+        chunkId,
+        index: entry && typeof entry.index === 'number' ? entry.index : null,
+        peerId: targetPeerId,
+        location: `peer:${targetPeerId}:${chunkId}`,
+        bytes: bytes.byteLength,
+      });
+    }
+
+    if (moved.length) {
+      const freedBytes = moved.reduce((acc, m) => acc + m.bytes, 0);
+      console.log(`🚀 Offloaded ${moved.length} chunk(s) (${freedBytes} bytes) to peer ${targetPeerId.slice(-8)}`);
+      if (onPendingDistributedCallback) {
+        try {
+          onPendingDistributedCallback(moved, targetPeerId);
+        } catch (e) {
+          console.warn('onPendingDistributed handler threw:', e.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Pending-chunk flush failed:', err.message);
+  } finally {
+    isFlushingPending = false;
+  }
+
+  return moved;
+}
+
 // ─── Hosted Chunk Stats (for proof-of-hosting UI) ───
 export function getHostedChunkStats() {
   let totalBytes = 0;
@@ -421,10 +623,133 @@ export function getHostedChunkStats() {
   };
 }
 
-// Load persisted hosted chunks from IndexedDB on startup
+// Per-chunk rows for the diagnostic table, newest arrival first.
+export function getHostedChunkLedger() {
+  const rows = [];
+  for (const [chunkId, chunk] of HOSTED_CHUNKS.entries()) {
+    const meta = HOSTED_META.get(chunkId) || {};
+    rows.push({
+      chunkId,
+      bytes: meta.bytes ?? chunk.byteLength ?? chunk.length ?? 0,
+      // Chunks stored before provenance existed fall back to their minted time.
+      receivedAt: meta.receivedAt ?? chunkIdTimestamp(chunkId),
+      fromPeerId: meta.fromPeerId ?? null,
+    });
+  }
+  rows.sort((a, b) => (b.receivedAt || 0) - (a.receivedAt || 0));
+  return rows;
+}
+
+// Chunks waiting on a peer to hand them to.
+export function getPendingChunkStats() {
+  let totalBytes = 0;
+  for (const entry of PENDING_CHUNKS.values()) {
+    totalBytes += (entry && entry.bytes) || 0;
+  }
+  return { count: PENDING_CHUNKS.size, totalBytes };
+}
+
+export function getPendingChunkIds() {
+  return Array.from(PENDING_CHUNKS.keys());
+}
+
+// Per-chunk rows for the queue, so the diagnostic table can list a pending
+// shard next to a hosted one with the same columns. Newest first.
+export function getPendingChunkLedger() {
+  const rows = [];
+  for (const [chunkId, entry] of PENDING_CHUNKS.entries()) {
+    rows.push({
+      chunkId,
+      bytes: (entry && entry.bytes) || 0,
+      createdAt: (entry && entry.createdAt) || chunkIdTimestamp(chunkId),
+      index: entry && typeof entry.index === 'number' ? entry.index : null,
+    });
+  }
+  rows.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  return rows;
+}
+
+// Measures the node's real IndexedDB footprint by walking both stores: our own
+// chunks (including anything pending) plus everything held for other peers.
+export async function getLocalStorageUsage() {
+  const empty = {
+    ownCount: 0, ownBytes: 0,
+    hostedCount: 0, hostedBytes: 0,
+    pendingCount: 0, pendingBytes: 0,
+    totalBytes: 0,
+  };
+
+  const sumStore = (db, storeName) => new Promise((resolve) => {
+    if (!db.objectStoreNames.contains(storeName)) return resolve({ count: 0, bytes: 0 });
+    let count = 0;
+    let bytes = 0;
+    try {
+      const req = db.transaction(storeName).objectStore(storeName).openCursor();
+      req.onsuccess = (e) => {
+        const cursor = e.target.result;
+        if (cursor) {
+          const value = cursor.value;
+          bytes += (value && (value.byteLength ?? value.length)) || 0;
+          count++;
+          cursor.continue();
+        } else {
+          resolve({ count, bytes });
+        }
+      };
+      req.onerror = () => resolve({ count, bytes });
+    } catch (e) {
+      resolve({ count, bytes });
+    }
+  });
+
+  try {
+    const db = await getDB();
+    const [own, hosted] = await Promise.all([
+      sumStore(db, 'chunks'),
+      sumStore(db, 'hosted'),
+    ]);
+    const pending = getPendingChunkStats();
+    return {
+      ownCount: own.count,
+      ownBytes: own.bytes,
+      hostedCount: hosted.count,
+      hostedBytes: hosted.bytes,
+      pendingCount: pending.count,
+      pendingBytes: pending.totalBytes,
+      totalBytes: own.bytes + hosted.bytes,
+    };
+  } catch (e) {
+    console.warn('Could not measure local storage usage:', e.message);
+    return empty;
+  }
+}
+
+// Load persisted hosted chunks (and their provenance) from IndexedDB on startup
 export async function loadHostedChunksFromDB() {
   try {
     const db = await getDB();
+
+    // Provenance first, so every chunk loaded below can find its origin.
+    if (db.objectStoreNames.contains('hostedMeta')) {
+      await new Promise((resolve) => {
+        try {
+          const cursorReq = db.transaction('hostedMeta').objectStore('hostedMeta').openCursor();
+          cursorReq.onsuccess = (e) => {
+            const cursor = e.target.result;
+            if (cursor) {
+              HOSTED_META.set(cursor.key, cursor.value);
+              cursor.continue();
+            } else {
+              resolve();
+            }
+          };
+          cursorReq.onerror = () => resolve();
+        } catch (e) {
+          resolve();
+        }
+      });
+    }
+
     return new Promise((resolve) => {
       const tx = db.transaction('hosted', 'readonly');
       const store = tx.objectStore('hosted');
@@ -446,6 +771,39 @@ export async function loadHostedChunksFromDB() {
     });
   } catch (e) {
     console.warn('Could not load hosted chunks from IndexedDB:', e);
+    return 0;
+  }
+}
+
+// Restore the pending-distribution queue so a file uploaded offline in an
+// earlier session is still handed off when a peer finally connects.
+export async function loadPendingChunksFromDB() {
+  try {
+    const db = await getDB();
+    if (!db.objectStoreNames.contains('pending')) return 0;
+
+    return new Promise((resolve) => {
+      let loaded = 0;
+      try {
+        const cursorReq = db.transaction('pending').objectStore('pending').openCursor();
+        cursorReq.onsuccess = (e) => {
+          const cursor = e.target.result;
+          if (cursor) {
+            PENDING_CHUNKS.set(cursor.key, cursor.value);
+            loaded++;
+            cursor.continue();
+          } else {
+            if (loaded) console.log(`🕗 ${loaded} chunk(s) still awaiting distribution`);
+            resolve(loaded);
+          }
+        };
+        cursorReq.onerror = () => resolve(loaded);
+      } catch (e) {
+        resolve(loaded);
+      }
+    });
+  } catch (e) {
+    console.warn('Could not load the pending queue from IndexedDB:', e);
     return 0;
   }
 }
