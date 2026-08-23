@@ -11,6 +11,15 @@ import { bootstrap } from '@libp2p/bootstrap';
 
 // ─── Constants ───
 const RELAY_PEER_ID = '12D3KooWAQhWksCm5kE41QFg1D4yEyWQEY7Ed4BFrGA5pDt955xJ';
+const RELAY_HOST = 'swarmvault-relay.onrender.com';
+const LOCAL_HOSTNAMES = ['localhost', '127.0.0.1', '[::1]', '::1'];
+
+// True when served from a real domain (Vercel, etc.) rather than local dev.
+// Production must use wss:// + /dns4/ — a hostname is not a valid /ip4/ address.
+function isProduction() {
+  if (typeof window === 'undefined') return false;
+  return !LOCAL_HOSTNAMES.includes(window.location.hostname);
+}
 
 let libp2pNode;
 let activePeers = new Map();
@@ -46,7 +55,9 @@ function getDB() {
 function connectSignalingServer(peerId, onPeerDiscovered, onPeerLost, onFileReceived) {
   onFileSharedCallback = onFileReceived;
   const wsHost = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
-  const signalingUrl = `ws://${wsHost}:10001`;
+  const signalingUrl = isProduction()
+    ? `wss://${RELAY_HOST}`
+    : `ws://${wsHost}:10001`;
   
   localPeerId = peerId;
   signalingWs = new WebSocket(signalingUrl);
@@ -230,8 +241,8 @@ export async function initP2PNode(onPeerDiscovered, onPeerLost, onFileReceived) 
     peerDiscovery: [
       bootstrap({
         list: [
-          typeof window !== 'undefined' 
-            ? `/ip4/${window.location.hostname === 'localhost' ? '127.0.0.1' : window.location.hostname}/tcp/10000/ws/p2p/${RELAY_PEER_ID}`
+          isProduction()
+            ? `/dns4/${RELAY_HOST}/tcp/443/wss/p2p/${RELAY_PEER_ID}`
             : `/ip4/127.0.0.1/tcp/10000/ws/p2p/${RELAY_PEER_ID}`
         ]
       }),
