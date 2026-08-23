@@ -13,12 +13,31 @@ import { bootstrap } from '@libp2p/bootstrap';
 const RELAY_PEER_ID = '12D3KooWAQhWksCm5kE41QFg1D4yEyWQEY7Ed4BFrGA5pDt955xJ';
 const RELAY_HOST = 'swarmvault-relay.onrender.com';
 const LOCAL_HOSTNAMES = ['localhost', '127.0.0.1', '[::1]', '::1'];
+// Private LAN addresses (and mDNS *.local names) are dev too — without this a
+// phone on 192.168.x.x:5173 would be treated as production and dial Render.
+const PRIVATE_HOST_RE = /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)|\.local$/;
 
 // True when served from a real domain (Vercel, etc.) rather than local dev.
 // Production must use wss:// + /dns4/ — a hostname is not a valid /ip4/ address.
 function isProduction() {
   if (typeof window === 'undefined') return false;
-  return !LOCAL_HOSTNAMES.includes(window.location.hostname);
+  const host = window.location.hostname;
+  if (LOCAL_HOSTNAMES.includes(host)) return false;
+  return !PRIVATE_HOST_RE.test(host);
+}
+
+// In dev, dial whatever host served the page. On a LAN test device that is the
+// dev machine's IP, so it reaches the relay there instead of its own loopback.
+function devHost() {
+  if (typeof window === 'undefined') return '127.0.0.1';
+  return window.location.hostname;
+}
+
+// /ip4/ only accepts a numeric address, so 'localhost' has to go through /dns4/.
+function devRelayMultiaddr() {
+  const host = devHost();
+  const proto = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) ? 'ip4' : 'dns4';
+  return `/${proto}/${host}/tcp/10000/ws/p2p/${RELAY_PEER_ID}`;
 }
 
 let libp2pNode;
@@ -54,10 +73,9 @@ function getDB() {
 // ─── Connect to Signaling + Data Relay Server ───
 function connectSignalingServer(peerId, onPeerDiscovered, onPeerLost, onFileReceived) {
   onFileSharedCallback = onFileReceived;
-  const wsHost = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
   const signalingUrl = isProduction()
-    ? `wss://${RELAY_HOST}`
-    : `ws://${wsHost}:10001`;
+    ? `wss://${RELAY_HOST}/signaling`
+    : `ws://${devHost()}:10000/signaling`;
   
   localPeerId = peerId;
   signalingWs = new WebSocket(signalingUrl);
@@ -243,7 +261,7 @@ export async function initP2PNode(onPeerDiscovered, onPeerLost, onFileReceived) 
         list: [
           isProduction()
             ? `/dns4/${RELAY_HOST}/tcp/443/wss/p2p/${RELAY_PEER_ID}`
-            : `/ip4/127.0.0.1/tcp/10000/ws/p2p/${RELAY_PEER_ID}`
+            : devRelayMultiaddr()
         ]
       }),
       pubsubPeerDiscovery({
